@@ -1,0 +1,698 @@
+
+---
+title: "Road Accident Severity Prediction & Safety Analysis"
+author: "Student"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 1. Introduction
+
+This project analyzes road accident records, explores factors associated with accident severity, and compares Logistic Regression and Random Forest classification models.
+
+The target variable is `Accident_severity`. The results describe associations in the dataset and do not prove causation.
+
+# 2. Load packages
+
+```{r packages}
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(nnet)
+library(rpart)
+library(rpart.plot)
+library(corrplot)
+```
+
+# 3. Load the dataset
+
+```{r load-data}
+data_path <- if (file.exists("RTA Dataset.csv")) {
+  "RTA Dataset.csv"
+} else {
+  "../RTA Dataset.csv"
+}
+
+raw_data <- read.csv(
+  data_path,
+  stringsAsFactors = FALSE,
+  na.strings = c("", " ", "na", "NA", "N/A", "n/a",
+                 "null", "NULL", "None")
+)
+
+cat("Dataset dimensions:\n")
+print(dim(raw_data))
+
+head(raw_data)
+str(raw_data)
+summary(raw_data)
+```
+
+# 4. Initial data-quality checks
+
+```{r data-quality}
+cat("Missing values per column:\n")
+print(colSums(is.na(raw_data)))
+
+cat("Total missing values:", sum(is.na(raw_data)), "\n")
+cat("Duplicate rows:", sum(duplicated(raw_data)), "\n")
+```
+
+# 5. Clean and prepare the data
+
+```{r cleaning}
+rta <- raw_data
+
+# Clean text fields and standardize missing-value markers.
+for (col in names(rta)) {
+  if (is.character(rta[[col]])) {
+    rta[[col]] <- trimws(rta[[col]])
+
+    missing_text <- tolower(rta[[col]]) %in%
+      c("", "na", "n/a", "null", "none")
+
+    rta[[col]][missing_text] <- NA_character_
+  }
+}
+
+# Remove duplicate records.
+rta <- rta[!duplicated(rta), ]
+
+# Do not invent labels for missing target values.
+if (!"Accident_severity" %in% names(rta)) {
+  stop("Accident_severity column not found.")
+}
+
+rta <- rta[!is.na(rta$Accident_severity), ]
+
+# Convert time into a time-of-day category.
+if ("Time" %in% names(rta)) {
+  time_text <- as.character(rta$Time)
+
+  parsed_time <- as.POSIXct(
+    time_text, format = "%H:%M:%S", tz = "UTC"
+  )
+
+  alternative <- is.na(parsed_time) & !is.na(time_text)
+
+  parsed_time[alternative] <- as.POSIXct(
+    time_text[alternative], format = "%H:%M", tz = "UTC"
+  )
+
+  hour <- suppressWarnings(
+    as.integer(format(parsed_time, "%H", tz = "UTC"))
+  )
+
+  rta$Time_period <- cut(
+    hour,
+    breaks = c(-1, 5, 11, 17, 23),
+    labels = c("Night", "Morning", "Afternoon", "Evening"),
+    include.lowest = TRUE
+  )
+
+  rta$Time <- NULL
+}
+
+# Remove identifiers and casualty-level fields that may leak
+# information about outcomes already observed.
+remove_columns <- c(
+  "Accident_ID",
+  "Casualty_class",
+  "Sex_of_casualty",
+  "Age_band_of_casualty",
+  "Casualty_severity",
+  "Work_of_casuality",
+  "Fitness_of_casuality"
+)
+
+rta <- rta %>% select(-any_of(remove_columns))
+
+# Remove columns that contain no observed values.
+all_missing <- names(rta)[
+  vapply(rta, function(x) all(is.na(x)), logical(1))
+]
+
+all_missing <- setdiff(all_missing, "Accident_severity")
+
+if (length(all_missing) > 0) {
+  rta <- rta %>% select(-all_of(all_missing))
+}
+
+rta$Accident_severity <- droplevels(
+  as.factor(rta$Accident_severity)
+)
+
+cat("Cleaned dataset dimensions:\n")
+print(dim(rta))
+
+cat("Severity distribution:\n")
+print(table(rta$Accident_severity))
+```
+
+# 6. Split the data and handle missing values
+
+The split occurs before imputation. Numeric medians and categorical modes are learned from the training set and then applied to the test set.
+
+```{r split-impute}
+set.seed(123)
+
+train_index <- createDataPartition(
+  rta$Accident_severity,
+  p = 0.80,
+  list = FALSE
+)
+
+train_data <- rta[train_index, , drop = FALSE]
+test_data <- rta[-train_index, , drop = FALSE]
+
+target <- "Accident_severity"
+predictors <- setdiff(names(train_data), target)
+
+# Remove predictors that are completely missing in training data.
+all_missing_train <- predictors[
+  vapply(
+    train_data[predictors],
+    function(x) all(is.na(x)),
+    logical(1)
+  )
+]
+
+if (length(all_missing_train) > 0) {
+  train_data <- train_data %>%
+    select(-all_of(all_missing_train))
+
+  test_data <- test_data %>%
+    select(-all_of(all_missing_train))
+}
+
+predictors <- setdiff(names(train_data), target)
+
+get_mode <- function(x) {
+  x <- as.character(x[!is.na(x)])
+
+  if (length(x) == 0) {
+    return("Unknown")
+  }
+
+  values <- unique(x)
+  values[which.max(tabulate(match(x, values)))]
+}
+
+# Store preprocessing values for future predictions.
+preprocess_info <- list()
+
+for (col in predictors) {
+
+  if (is.numeric(train_data[[col]])) {
+
+    med <- median(train_data[[col]], na.rm = TRUE)
+
+    if (!is.finite(med)) {
+      med <- 0
+    }
+
+    train_data[[col]][is.na(train_data[[col]])] <- med
+    test_data[[col]][is.na(test_data[[col]])] <- med
+
+    preprocess_info[[col]] <- list(
+      type = "numeric",
+      value = med
+    )
+
+  } else {
+
+    train_values <- as.character(train_data[[col]])
+    mode_value <- get_mode(train_values)
+
+    train_values[is.na(train_values)] <- mode_value
+    train_levels <- unique(train_values)
+
+    test_values <- as.character(test_data[[col]])
+    test_values[is.na(test_values)] <- mode_value
+
+    # Replace categories that were not seen during training.
+    unseen <- !test_values %in% train_levels
+
+    if (any(unseen)) {
+      test_values[unseen] <- mode_value
+    }
+
+    train_data[[col]] <- factor(
+      train_values,
+      levels = train_levels
+    )
+
+    test_data[[col]] <- factor(
+      test_values,
+      levels = train_levels
+    )
+
+    preprocess_info[[col]] <- list(
+      type = "categorical",
+      value = mode_value,
+      levels = train_levels
+    )
+  }
+}
+
+train_data$Accident_severity <- droplevels(
+  as.factor(train_data$Accident_severity)
+)
+
+test_data$Accident_severity <- factor(
+  test_data$Accident_severity,
+  levels = levels(train_data$Accident_severity)
+)
+
+cat("Training rows:", nrow(train_data), "\n")
+cat("Testing rows:", nrow(test_data), "\n")
+cat("Missing values in training:", sum(is.na(train_data)), "\n")
+cat("Missing values in testing:", sum(is.na(test_data)), "\n")
+```
+
+# 7. Exploratory data analysis
+
+## 7.1 Accident severity distribution
+
+```{r severity-distribution}
+severity_count <- table(rta$Accident_severity)
+
+severity_percentage <- prop.table(severity_count) * 100
+
+severity_summary <- data.frame(
+  Severity = names(severity_count),
+  Count = as.integer(severity_count),
+  Percentage = round(as.numeric(severity_percentage), 2)
+)
+
+knitr::kable(severity_summary)
+
+ggplot(rta, aes(x = Accident_severity)) +
+  geom_bar() +
+  labs(
+    title = "Distribution of Road Accident Severity",
+    x = "Accident severity",
+    y = "Number of records"
+  ) +
+  theme_minimal()
+```
+
+## 7.2 Analyze driver, vehicle, road, weather and lighting factors
+
+```{r factor-analysis, fig.width=9, fig.height=5}
+analysis_columns <- c(
+  "Age_band_of_driver",
+  "Driving_experience",
+  "Sex_of_driver",
+  "Type_of_vehicle",
+  "Number_of_vehicles_involved",
+  "Road_surface_conditions",
+  "Road_allignment",
+  "Weather_conditions",
+  "Light_conditions",
+  "Area_accident_occured",
+  "Number_of_casualties",
+  "Cause_of_accident"
+)
+
+analysis_columns <- intersect(analysis_columns, names(rta))
+
+for (col in analysis_columns) {
+
+  p <- ggplot(
+    rta,
+    aes(x = .data[[col]], fill = Accident_severity)
+  ) +
+    geom_bar(position = "dodge") +
+    labs(
+      title = paste("Accident severity by", col),
+      x = col,
+      y = "Number of records",
+      fill = "Severity"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  print(p)
+}
+```
+
+## 7.3 Compare severity percentages
+
+```{r severity-percentages}
+if ("Weather_conditions" %in% names(rta)) {
+  weather_table <- table(
+    rta$Weather_conditions,
+    rta$Accident_severity
+  )
+
+  cat("Severity percentages within each weather category:\n")
+
+  print(
+    round(prop.table(weather_table, margin = 1) * 100, 2)
+  )
+}
+
+if ("Road_surface_conditions" %in% names(rta)) {
+  surface_table <- table(
+    rta$Road_surface_conditions,
+    rta$Accident_severity
+  )
+
+  cat("Severity percentages within each road-surface category:\n")
+
+  print(
+    round(prop.table(surface_table, margin = 1) * 100, 2)
+  )
+}
+```
+
+## 7.4 Numeric correlations
+
+```{r correlations, fig.width=8, fig.height=7}
+numeric_data <- rta %>% select(where(is.numeric))
+
+if (ncol(numeric_data) >= 2) {
+
+  correlation_matrix <- cor(
+    numeric_data,
+    use = "pairwise.complete.obs"
+  )
+
+  corrplot(
+    correlation_matrix,
+    method = "color",
+    type = "upper",
+    tl.cex = 0.7,
+    title = "Correlation Between Numeric Variables",
+    mar = c(0, 0, 2, 0)
+  )
+
+} else {
+  cat("Not enough numeric variables for a correlation plot.\n")
+}
+```
+
+# 8. Train Logistic Regression
+
+```{r logistic-model}
+set.seed(123)
+
+logistic_model <- caret::train(
+  Accident_severity ~ .,
+  data = train_data,
+  method = "multinom",
+  trControl = trainControl(method = "none"),
+  trace = FALSE
+)
+
+logistic_model
+```
+
+# 9. Train Random Forest
+
+```{r random-forest}
+set.seed(123)
+
+rf_model <- randomForest(
+  Accident_severity ~ .,
+  data = train_data,
+  ntree = 300,
+  importance = TRUE
+)
+
+rf_model
+```
+```{r balanced-random-forest}
+set.seed(123)
+
+# Give fatal injuries more importance
+class_weights <- c(
+  "Fatal injury" = 5,
+  "Serious Injury" = 2,
+  "Slight Injury" = 1
+)
+
+rf_model_balanced <- randomForest(
+  Accident_severity ~ .,
+  data = train_data,
+  ntree = 300,
+  importance = TRUE,
+  classwt = class_weights
+)
+
+# Evaluate using the same test dataset
+balanced_predictions <- predict(
+  rf_model_balanced,
+  newdata = test_data
+)
+
+caret::confusionMatrix(
+  balanced_predictions,
+  test_data$Accident_severity
+)
+```
+
+
+
+```{r stronger-class-weights}
+set.seed(123)
+
+class_weights_strong <- c(
+  "Fatal injury" = 20,
+  "Serious Injury" = 3,
+  "Slight Injury" = 1
+)
+
+rf_model_strong <- randomForest(
+  Accident_severity ~ .,
+  data = train_data,
+  ntree = 300,
+  importance = TRUE,
+  classwt = class_weights_strong
+)
+
+strong_predictions <- predict(
+  rf_model_strong,
+  newdata = test_data
+)
+
+
+strong_cm <- caret::confusionMatrix(
+  strong_predictions,
+  test_data$Accident_severity
+)
+
+print(strong_cm)
+
+```
+
+
+
+# 10. Evaluate the models
+
+```{r evaluate-models}
+logistic_predictions <- predict(
+  logistic_model,
+  newdata = test_data
+)
+
+rf_predictions <- predict(
+  rf_model,
+  newdata = test_data
+)
+
+logistic_cm <- confusionMatrix(
+  logistic_predictions,
+  test_data$Accident_severity
+)
+
+rf_cm <- confusionMatrix(
+  rf_predictions,
+  test_data$Accident_severity
+)
+
+logistic_cm
+rf_cm
+```
+
+The weighted models are compared on the same held-out test set. Class weights may improve detection of rare classes, but the resulting predictions must be evaluated for both missed cases and false alarms.
+## 10.1 Compare accuracy
+
+```{r model-comparison}
+# Recall for a class = correctly predicted cases / all actual cases of that class.
+get_class_recall <- function(cm, class_name) {
+  tab <- cm$table
+  if (!class_name %in% rownames(tab) || !class_name %in% colnames(tab)) {
+    return(NA_real_)
+  }
+  actual_count <- sum(tab[, class_name])
+  if (actual_count == 0) return(NA_real_)
+  as.numeric(tab[class_name, class_name] / actual_count)
+}
+
+model_comparison <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "Weighted Random Forest (20/3/1)"),
+  Accuracy = c(
+    as.numeric(logistic_cm$overall["Accuracy"]),
+    as.numeric(rf_cm$overall["Accuracy"]),
+    as.numeric(strong_cm$overall["Accuracy"])
+  ),
+  Fatal_Injury_Recall = c(
+    get_class_recall(logistic_cm, "Fatal injury"),
+    get_class_recall(rf_cm, "Fatal injury"),
+    get_class_recall(strong_cm, "Fatal injury")
+  ),
+  Serious_Injury_Recall = c(
+    get_class_recall(logistic_cm, "Serious Injury"),
+    get_class_recall(rf_cm, "Serious Injury"),
+    get_class_recall(strong_cm, "Serious Injury")
+  )
+)
+
+knitr::kable(
+  transform(
+    model_comparison,
+    Accuracy = round(Accuracy, 4),
+    Fatal_Injury_Recall = round(Fatal_Injury_Recall, 4),
+    Serious_Injury_Recall = round(Serious_Injury_Recall, 4)
+  ),
+  caption = "Comparison on the held-out test set"
+)
+
+ggplot(model_comparison, aes(x = Model, y = Accuracy)) +
+  geom_col() +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(
+    title = "Model Accuracy Comparison",
+    x = "Model",
+    y = "Accuracy"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+## 10.2 Class-wise metrics
+
+```{r class-metrics}
+cat("Logistic Regression class-wise results:\n")
+print(logistic_cm$byClass)
+
+cat("\nRandom Forest class-wise results:\n")
+print(rf_cm$byClass)
+
+cat("\nWeighted Random Forest class-wise results:\n")
+print(strong_cm$byClass)
+```
+
+
+```{r confusion-matrix-plot}
+# Create a visual confusion matrix for Random Forest
+cm_table <- as.data.frame(rf_cm$table)
+
+ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(
+    title = "Random Forest Confusion Matrix",
+    x = "Actual Accident Severity",
+    y = "Predicted Accident Severity",
+    fill = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+Since fatal accidents may be uncommon, inspect the fatal class's precision and recall rather than relying on overall accuracy alone.
+
+# 11. Random Forest feature importance
+
+```{r importance}
+importance(rf_model)
+
+varImpPlot(
+  rf_model,
+  main = "Random Forest Variable Importance"
+)
+```
+
+Feature importance indicates which variables the model relies on; it does not establish causation.
+
+# 12. Results summary
+
+```{r results-summary}
+print(model_comparison)
+
+best_accuracy_model <- model_comparison$Model[
+  which.max(model_comparison$Accuracy)
+]
+cat("Highest-accuracy model:", best_accuracy_model, "\n")
+cat("Important: model selection should also consider fatal- and serious-injury recall, not accuracy alone.\n")
+```
+
+# 13. Prepare and save the model for the Shiny app
+
+The app uses five driver and environmental inputs. This compact model is saved with the training factor levels so the app can construct compatible inputs.
+
+```{r five-feature-model}
+# Select the five inputs for our prediction app
+selected_columns <- c(
+  "Age_band_of_driver",
+  "Driving_experience",
+  "Weather_conditions",
+  "Road_surface_conditions",
+  "Light_conditions"
+)
+
+# Train a model using only these five inputs
+set.seed(123)
+
+rf_model_five <- randomForest(
+  x = train_data[, selected_columns, drop = FALSE],
+  y = train_data$Accident_severity,
+  ntree = 100,
+  importance = TRUE
+)
+
+# Test the model
+five_feature_predictions <- predict(
+  rf_model_five,
+  newdata = test_data[, selected_columns, drop = FALSE]
+)
+
+print(
+  caret::confusionMatrix(
+    five_feature_predictions,
+    test_data$Accident_severity
+  )
+)
+
+# Save the model so app.R can use it
+saveRDS(
+  list(
+    model = rf_model_five,
+    train_data = train_data,
+    selected_columns = selected_columns
+  ),
+  file = "road_accident_model_bundle.rds"
+)
+
+cat("Model saved successfully!")
+```
+
+
+# 14. Conclusion
+
+This project examines accident severity patterns, performs data preparation, and compares Logistic Regression with Random Forest using a held-out test set.
+
+Use the actual metrics and charts generated by the report to describe your findings. Do not claim that any factor causes accident severity based on these observational data.
